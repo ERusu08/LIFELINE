@@ -1,5 +1,6 @@
-
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { openDB } from "idb";
+import EmergencyMap from "./components/EmergencyMap";
 import RequestForm from "./components/RequestForm";
 import {
   Activity,
@@ -18,12 +19,36 @@ import {
   WifiOff,
 } from "lucide-react";
 
+
+const dbPromise = openDB("lifeline-db", 1, {
+  upgrade(db) {
+    if (!db.objectStoreNames.contains("requests")) {
+      db.createObjectStore("requests", {
+        keyPath: "id",
+      });
+    }
+  },
+});
+
+async function saveRequest(request) {
+  const db = await dbPromise;
+  await db.put("requests", request);
+}
+
+async function getSavedRequests() {
+  const db = await dbPromise;
+  return db.getAll("requests");
+}
+
+
 const initialRequests = [
   {
     id: "SOS-104",
     name: "Household A",
     category: "Water supplies",
     location: "Camden",
+    lat: 51.539,
+    lng: -0.142,
     people: 3,
     urgency: "Critical",
     status: "Open",
@@ -34,6 +59,8 @@ const initialRequests = [
     name: "Household B",
     category: "Medical assistance",
     location: "Kentish Town",
+    lat: 51.550	,
+    lng: -0.141,
     people: 2,
     urgency: "High",
     status: "Assigned",
@@ -44,6 +71,8 @@ const initialRequests = [
     name: "Household C",
     category: "Shelter",
     location: "Chalk Farm",
+    lat: 51.545,
+    lng: -0.157,
     people: 4,
     urgency: "Medium",
     status: "Open",
@@ -54,6 +83,8 @@ const initialRequests = [
     name: "Household D",
     category: "Food supplies",
     location: "Camden",
+    lat: 51.535,
+    lng: -0.135,
     people: 2,
     urgency: "Low",
     status: "Resolved",
@@ -62,9 +93,51 @@ const initialRequests = [
 ];
 
 function App() {
-  const [requests, setRequests] = useState(initialRequests);
+  const [requests, setRequests] = useState([]);
+  const [dataLoaded, setDataLoaded] = useState(false);
   const [networkOnline, setNetworkOnline] = useState(true);
   const [formOpen, setFormOpen] = useState(false);
+
+  useEffect(() => {
+    async function loadRequests() {
+      try {
+        const savedRequests = await getSavedRequests();
+
+        if (savedRequests.length > 0) {
+          setRequests(savedRequests);
+        } else {
+          setRequests(initialRequests);
+
+          for (const request of initialRequests) {
+            await saveRequest(request);
+          }
+        }
+      } catch (error) {
+        console.error("Failed to load requests:", error);
+        setRequests(initialRequests);
+      } finally {
+        setDataLoaded(true);
+      }
+    }
+
+    loadRequests();
+  }, []);
+
+  useEffect(() => {
+    if (!dataLoaded) return;
+
+    async function persistRequests() {
+      try {
+        for (const request of requests) {
+          await saveRequest(request);
+        }
+      } catch (error) {
+        console.error("Failed to save requests:", error);
+      }
+    }
+
+    persistRequests();
+  }, [requests, dataLoaded]);
 
   const openRequests = requests.filter(
     (request) => request.status === "Open"
@@ -282,6 +355,7 @@ function App() {
             </section>
           </div>
 
+
           <section className="panel map-placeholder">
             <div className="panel-heading">
               <div>
@@ -293,13 +367,7 @@ function App() {
               </span>
             </div>
 
-            <div className="map-content">
-              <div className="map-message">
-                <MapPin size={30} />
-                <strong>Interactive response map</strong>
-                <span>We'll integrate live incident markers here next.</span>
-              </div>
-            </div>
+            <EmergencyMap requests={requests} />
           </section>
 
           <footer className="footer">
@@ -312,7 +380,8 @@ function App() {
       {formOpen && (
         <RequestForm
           onClose={() => setFormOpen(false)}
-          onSubmit={(newRequest) => {
+          onSubmit={async (newRequest) => {
+            await saveRequest(newRequest);
             setRequests((previous) => [newRequest, ...previous]);
           }}
         />

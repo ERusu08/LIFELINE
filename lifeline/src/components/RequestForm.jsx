@@ -1,6 +1,6 @@
 
 import { useState } from "react";
-import { X, Send, AlertTriangle } from "lucide-react";
+import { X, Send, AlertTriangle, MapPin, LocateFixed } from "lucide-react";
 
 export default function RequestForm({ onClose, onSubmit }) {
   const [form, setForm] = useState({
@@ -12,6 +12,10 @@ export default function RequestForm({ onClose, onSubmit }) {
     description: "",
   });
 
+  const [coordinates, setCoordinates] = useState(null);
+  const [locationError, setLocationError] = useState("");
+  const [locating, setLocating] = useState(false);
+
   function update(field, value) {
     setForm((previous) => ({
       ...previous,
@@ -19,11 +23,49 @@ export default function RequestForm({ onClose, onSubmit }) {
     }));
   }
 
+  function getLocation() {
+    if (!navigator.geolocation) {
+      setLocationError("Your browser does not support geolocation.");
+      return;
+    }
+
+    setLocating(true);
+    setLocationError("");
+
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        setCoordinates({
+          lat: position.coords.latitude,
+          lng: position.coords.longitude,
+        });
+        setLocating(false);
+      },
+      (error) => {
+        setLocationError(
+          error.code === 1
+            ? "Location permission denied. Please allow location access."
+            : "Could not retrieve your location. Please try again."
+        );
+        setLocating(false);
+      },
+      {
+        enableHighAccuracy: true,
+        timeout: 10000,
+      }
+    );
+  }
+
   function handleSubmit(event) {
     event.preventDefault();
 
+    if (!coordinates) {
+      setLocationError("Please capture your location before submitting.");
+      return;
+    }
+
     const request = {
       ...form,
+      ...coordinates,
       id: `SOS-${Date.now()}`,
       status: "Open",
       time: "Just now",
@@ -44,6 +86,7 @@ export default function RequestForm({ onClose, onSubmit }) {
             <h2>New emergency request</h2>
             <p>Submit a report for your local response network.</p>
           </div>
+
           <button type="button" className="icon-button" onClick={onClose}>
             <X />
           </button>
@@ -75,7 +118,7 @@ export default function RequestForm({ onClose, onSubmit }) {
         </label>
 
         <label>
-          Location
+          Location / neighbourhood
           <input
             required
             value={form.location}
@@ -83,6 +126,30 @@ export default function RequestForm({ onClose, onSubmit }) {
             placeholder="Enter neighbourhood or postcode"
           />
         </label>
+
+        <div>
+          <button
+            type="button"
+            className="network-button"
+            onClick={getLocation}
+            disabled={locating}
+          >
+            <LocateFixed size={16} />
+            {locating ? "Finding location..." : "Use my current location"}
+          </button>
+
+          {coordinates && (
+            <p style={{ color: "#22c55e", fontSize: "12px", marginTop: "8px" }}>
+              <MapPin size={13} /> Location captured successfully
+            </p>
+          )}
+
+          {locationError && (
+            <p style={{ color: "#ef7777", fontSize: "12px", marginTop: "8px" }}>
+              {locationError}
+            </p>
+          )}
+        </div>
 
         <label>
           Number of people affected
@@ -128,6 +195,7 @@ export default function RequestForm({ onClose, onSubmit }) {
           <button type="button" className="cancel-button" onClick={onClose}>
             Cancel
           </button>
+
           <button type="submit" className="submit-button">
             <Send size={16} /> Submit request
           </button>
