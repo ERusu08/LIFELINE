@@ -24,8 +24,6 @@ const agentReportIds = new Map(
   agents.map((agent) => [agent.id, new Set()]),
 );
 
-let geminiClient;
-
 console.log("Gemini key loaded:", Boolean(process.env.GEMINI_API_KEY));
 
 function addEvent(type, agentId, entityId, details = {}) {
@@ -94,68 +92,71 @@ function classifyLocally(description) {
 
   return { type, urgency };
 }
-function withTimeout(promise, milliseconds) {
-  let timer;
 
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(
-      () => reject(new Error("Gemini request timed out")),
-      milliseconds,
-    );
-  });
-
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
-}
 async function classifyWithGemini(description) {
   const fallback = classifyLocally(description);
+  const apiKey = process.env.GEMINI_API_KEY;
 
-  if (!process.env.GEMINI_API_KEY) {
+  if (!apiKey) {
     return { ...fallback, source: "rules" };
   }
 
   try {
-    if (!geminiClient) {
-      const { GoogleGenAI } = await import("@google/genai");
-      geminiClient = new GoogleGenAI({
-        apiKey: process.env.GEMINI_API_KEY,
-      });
+    const response = await fetch(
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": apiKey,
+        },
+        body: JSON.stringify({
+          contents: [
+            {
+              parts: [
+                {
+                  text: `Classify this emergency report. Return JSON only with "type" and "urgency".
+Allowed type values: SOS, MEDICAL, SUPPLIES, OFFER_HELP, SAFE.
+Allowed urgency values: critical, high, medium, low.
+Do not give advice.
+Report: ${description}`,
+                },
+              ],
+            },
+          ],
+          generationConfig: {
+            responseMimeType: "application/json",
+          },
+        }),
+        signal: AbortSignal.timeout(20000),
+      },
+    );
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(
+        `Gemini HTTP ${response.status}: ${
+          data.error?.message || JSON.stringify(data).slice(0, 300)
+        }`,
+      );
     }
 
-    const result = await withTimeout(geminiClient.interactions.create({
-      model: "gemini-3.8-flash",
-      input: `Classify this emergency report. Do not give advice.
-Report: ${description}`,
-      response_format: {
-        type: "text",
-        mime_type: "application/json",
-        schema: {
-          type: "object",
-          properties: {
-            type: {
-              type: "string",
-              enum: ["SOS", "MEDICAL", "SUPPLIES", "OFFER_HELP", "SAFE"],
-            },
-            urgency: {
-              type: "string",
-              enum: ["critical", "high", "medium", "low"],
-            },
-          },
-          required: ["type", "urgency"],
-        },
-      },
-   }), 15000);
+    const responseText = data.candidates?.[0]?.content?.parts
+      ?.map((part) => part.text || "")
+      .join("");
 
-    if (!result.output_text) {
+    if (!responseText) {
       throw new Error("Gemini returned an empty response");
     }
 
-    const parsed = JSON.parse(result.output_text);
-    const validTypes = ["SOS", "MEDICAL", "SUPPLIES", "OFFER_HELP", "SAFE"];
-    const validUrgencies = ["critical", "high", "medium", "low"];
+    const parsed = JSON.parse(responseText);
+    const types = ["SOS", "MEDICAL", "SUPPLIES", "OFFER_HELP", "SAFE"];
+    const urgencies = ["critical", "high", "medium", "low"];
 
     return {
-      type: validTypes.includes(parsed.type) ? parsed.type : fallback.type,
-      urgency: validUrgencies.includes(parsed.urgency)
+      type: types.includes(parsed.type) ? parsed.type : fallback.type,
+      urgency: urgencies.includes(parsed.urgency)
         ? parsed.urgency
         : fallback.urgency,
       source: "gemini",
