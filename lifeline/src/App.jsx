@@ -2,7 +2,16 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import EmergencyMap from "./components/EmergencyMap";
 import RequestForm from "./components/RequestForm";
 import NetworkPanel from "./components/NetworkPanel";
-import { saveRequest, getRequest, getSavedRequests } from "./utils/db";
+import VolunteerPanel, { RequestMatches } from "./components/VolunteerPanel";
+import OfflineSync from "./components/OfflineSync";
+import {
+  saveRequest,
+  getRequest,
+  getSavedRequests,
+  saveVolunteer,
+  getVolunteer,
+  getSavedVolunteers,
+} from "./utils/db";
 import {
   decideMerge,
   formatRelativeTime,
@@ -11,8 +20,16 @@ import {
   upsertRequest,
   validateRequest,
   withStatus,
+  withAssignment,
+  fitsCapacity,
+  remainingCapacity,
+  validateVolunteer,
+  upsertVolunteer,
+  mergeVolunteerLists,
+  volunteerIdForDevice,
   STATUSES,
   MAX_SYNC_REQUESTS,
+  MAX_SYNC_VOLUNTEERS,
 } from "./utils/requestSync";
 
 import { Heart, MapPin, Plus, Wifi, WifiOff } from "lucide-react";
@@ -102,12 +119,16 @@ function App() {
   const [delivery, setDelivery] = useState({}); // id -> { state, ackedBy: [] }
   const [device, setDevice] = useState(loadDevice);
   const [now, setNow] = useState(() => Date.now());
+  const [volunteers, setVolunteers] = useState([]);
 
   const requestsRef = useRef([]);
   const networkSenderRef = useRef(null); // registered by NetworkPanel
   const inFlightRef = useRef(new Set()); // incoming IDs currently being saved
   const savingIdsRef = useRef(new Set()); // locally created IDs already submitted
   const sectionRefs = useRef({});
+  const volunteersRef = useRef([]);
+  const volunteerSenderRef = useRef(null); // registered by NetworkPanel
+  const inFlightVolunteersRef = useRef(new Set());
 
   // Single place that changes the request list, so the ref used by the
   // network code is always in sync with React state.
@@ -115,6 +136,14 @@ function App() {
     setRequests((previous) => {
       const next = update(previous);
       requestsRef.current = next;
+      return next;
+    });
+  }, []);
+
+  const applyVolunteers = useCallback((update) => {
+    setVolunteers((previous) => {
+      const next = update(previous);
+      volunteersRef.current = next;
       return next;
     });
   }, []);
@@ -153,6 +182,21 @@ function App() {
       cancelled = true;
     };
   }, [applyRequests]);
+
+  // Volunteers load separately so a problem there never hides the requests.
+  useEffect(() => {
+    let cancelled = false;
+    getSavedVolunteers()
+      .then((saved) => {
+        if (cancelled) return;
+        const valid = saved.filter((item) => validateVolunteer(item).ok);
+        applyVolunteers((current) => mergeVolunteerLists(valid, current));
+      })
+      .catch((error) => console.error("Failed to load volunteers:", error));
+    return () => {
+      cancelled = true;
+    };
+  }, [applyVolunteers]);
 
   // ---------------- RECEIVE EMERGENCY ----------------
   // Called by NetworkPanel for every SOS_REQUEST. Returns a result so the
@@ -206,6 +250,133 @@ function App() {
       inFlightRef.current.delete(incoming.id);
     }
   }, [applyRequests]);
+
+  // ---------------- VOLUNTEERS ----------------
+
+  const handleIncomingVolunteer = useCallback(async (raw, meta = {}) => {
+    const checked = validateVolunteer(raw);
+    if (!checked.ok) {
+      console.warn("Rejected incoming volunteer:", checked.error);
+      return { ok: false, error: checked.error };
+    }
+    const incoming = checked.volunteer;
+
+    if (inFlightVolunteersRef.current.has(incoming.id)) {
+      return { ok: true, status: "duplicate", volunteer: incoming };
+    }
+    inFlightVolunteersRef.current.add(incoming.id);
+
+    try {
+      const existing = await getVolunteer(incoming.id);
+      const decision = decideMerge(existing, incoming);
+      if (decision === "duplicate") return { ok: true, status: "duplicate", volunteer: existing };
+
+      await saveVolunteer(incoming);
+      applyVolunteers((previous) => upsertVolunteer(previous, incoming));
+      setTransferStatus(
+        decision === "new"
+          ? `Volunteer ${incoming.name} registered (from ${meta.fromLabel || "another device"}).`
+          : `Volunteer ${incoming.name} updated.`
+      );
+      return { ok: true, status: decision, volunteer: incoming };
+    } catch (error) {
+      console.error("Failed to save incoming volunteer:", error);
+      return { ok: false, error: "Could not save on the receiving device." };
+    } finally {
+      inFlightVolunteersRef.current.delete(incoming.id);
+    }
+  }, [applyVolunteers]);
+
+  // One profile per device. Returns false if it could not be saved.
+  async function handleSaveVolunteer(profile) {
+    const id = volunteerIdForDevice(device.id);
+    const existing = volunteersRef.current.find((item) => item.id === id);
+    const nowMs = Date.now();
+    const previousStamp = existing ? Date.parse(existing.updatedAt) : 0;
+    const volunteer = {
+      id,
+      name: profile.name,
+      skills: profile.skills,
+      area: profile.area || "",
+      available: profile.available !== false,
+      ...(Number.isInteger(profile.capacity) ? { capacity: profile.capacity } : {}),
+      createdAt: existing?.createdAt || new Date(nowMs).toISOString(),
+      updatedAt: new Date(Math.max(nowMs, previousStamp + 1)).toISOString(),
+    };
+
+    const checked = validateVolunteer(volunteer);
+    if (!checked.ok) {
+      setTransferStatus(checked.error);
+      return false;
+    }
+
+    try {
+      await saveVolunteer(checked.volunteer);
+    } catch (error) {
+      console.error("Failed to save volunteer:", error);
+      setTransferStatus("Could not save the volunteer profile on this device.");
+      return false;
+    }
+
+    applyVolunteers((previous) => upsertVolunteer(previous, checked.volunteer));
+    const sent = volunteerSenderRef.current ? volunteerSenderRef.current(checked.volunteer) : false;
+    setTransferStatus(
+      sent
+        ? `Volunteer profile saved and shared with connected devices.`
+        : `Volunteer profile saved on this device. It will be shared when you pair a device.`
+    );
+    return true;
+  }
+
+  // Assigning is a normal request update, so it saves locally, syncs to peers
+  // and is only "delivered" after an ACK.
+  async function handleAssign(request, volunteer) {
+    // Re-check with the latest data: another device may have assigned this volunteer meanwhile.
+    if (!fitsCapacity(volunteer, request, requestsRef.current)) {
+      const room = remainingCapacity(volunteer, requestsRef.current);
+      setTransferStatus(
+        `${volunteer.name} can only take ${Math.max(room, 0)} more ${room === 1 ? "person" : "people"}; ${request.id} needs ${request.people}.`
+      );
+      return;
+    }
+    const changed = withAssignment(request, volunteer);
+    if (changed === request) return;
+    await persistAndSend(changed, `assigned to ${volunteer.name}`);
+  }
+
+  // ---------------- OFFLINE SYNC (QR / file / pasted code) ----------------
+  // The sync code is only a carrier. Every item goes through the same
+  // validation and merge rules as items arriving over a live link.
+
+  const handleSyncImport = useCallback(async (data) => {
+    const tally = { created: 0, updated: 0, duplicate: 0, rejected: 0, volunteers: 0, volunteerDuplicates: 0 };
+    const meta = { fromLabel: data.deviceName || "another device" };
+
+    for (const raw of data.requests) {
+      const result = await handleIncomingRequest(raw, meta);
+      if (!result.ok) tally.rejected += 1;
+      else if (result.status === "new") tally.created += 1;
+      else if (result.status === "update") tally.updated += 1;
+      else tally.duplicate += 1;
+      // Pass new information on to any devices this one is linked to right now.
+      if (result.ok && result.status !== "duplicate") networkSenderRef.current?.(result.request);
+    }
+
+    for (const raw of data.volunteers) {
+      const result = await handleIncomingVolunteer(raw, meta);
+      if (!result.ok) tally.rejected += 1;
+      else if (result.status === "duplicate") tally.volunteerDuplicates += 1;
+      else {
+        tally.volunteers += 1;
+        volunteerSenderRef.current?.(result.volunteer);
+      }
+    }
+
+    setTransferStatus(
+      `Offline sync from ${meta.fromLabel}: ${tally.created} new, ${tally.updated} updated, ${tally.duplicate} already had, ${tally.rejected} rejected.`
+    );
+    return tally;
+  }, [handleIncomingRequest, handleIncomingVolunteer]);
 
   // ---------------- SEND EMERGENCY ----------------
 
@@ -278,6 +449,15 @@ function App() {
     setNetwork(status);
   }, []);
 
+  const handleVolunteerSenderRegistration = useCallback((sender) => {
+    volunteerSenderRef.current = sender;
+  }, []);
+
+  const getSyncVolunteers = useCallback(
+    () => volunteersRef.current.slice(0, MAX_SYNC_VOLUNTEERS),
+    []
+  );
+
   const getSyncRequests = useCallback(
     () => requestsRef.current.filter(isShareable).slice(0, MAX_SYNC_REQUESTS),
     []
@@ -303,6 +483,7 @@ function App() {
   const networkOnline = network.openCount > 0;
   const count = (status) => requests.filter((request) => request.status === status).length;
   const openRequests = count("Open");
+  const myVolunteer = volunteers.find((item) => item.id === volunteerIdForDevice(device.id)) || null;
 
   function deliveryText(request) {
     if (request.source === "remote") return `From ${request.receivedFrom || "another device"}`;
@@ -330,7 +511,9 @@ function App() {
               Requests <span className="nav-count">{openRequests}</span>
             </button>
             <button type="button" onClick={() => scrollTo("map")}>Map</button>
+            <button type="button" onClick={() => scrollTo("volunteers")}>Volunteers</button>
             <button type="button" onClick={() => scrollTo("network")}>Device links</button>
+            <button type="button" onClick={() => scrollTo("offline")}>Offline sync</button>
           </nav>
 
           <span
@@ -352,7 +535,7 @@ function App() {
             <h1>Community desk</h1>
             <p>
               Requests are kept on this device ({device.name}) and passed directly
-              between paired devices. No server involved.
+              between paired devices. Everything works without a server.
             </p>
           </div>
           <button className="btn primary" onClick={() => setFormOpen(true)}>
@@ -370,6 +553,7 @@ function App() {
           <div><dt>Open</dt><dd>{openRequests}</dd></div>
           <div><dt>Assigned</dt><dd>{count("Assigned")}</dd></div>
           <div><dt>Resolved</dt><dd>{count("Resolved")}</dd></div>
+          <div><dt>Volunteers available</dt><dd>{volunteers.filter((v) => v.available).length}</dd></div>
           <div><dt>Linked devices</dt><dd>{network.openCount}</dd></div>
         </dl>
 
@@ -407,6 +591,12 @@ function App() {
                       <code>{request.id}</code> · {formatRelativeTime(request, now)}
                       {request.source === "demo" && " · sample data"}
                     </small>
+                    {request.assignedTo && request.status !== "Open" && (
+                      <small className="request-assigned" data-testid="assigned-to">
+                        Assigned to {request.assignedTo}
+                      </small>
+                    )}
+                    <RequestMatches request={request} volunteers={volunteers} requests={requests} onAssign={handleAssign} />
                     {deliveryText(request) && (
                       <small className="request-delivery" data-testid="delivery">{deliveryText(request)}</small>
                     )}
@@ -439,15 +629,38 @@ function App() {
 
         </div>
 
+        <div ref={(el) => { sectionRefs.current.volunteers = el; }}>
+          <VolunteerPanel
+            me={myVolunteer}
+            volunteers={volunteers}
+            requests={requests}
+            deviceName={device.name}
+            onSave={handleSaveVolunteer}
+            onAssign={handleAssign}
+          />
+        </div>
+
         <div ref={(el) => { sectionRefs.current.network = el; }}>
           <NetworkPanel
             device={device}
             onDeviceNameChange={handleDeviceNameChange}
             onMessage={handleIncomingRequest}
             onRegisterSender={handleSenderRegistration}
+            onVolunteer={handleIncomingVolunteer}
+            onRegisterVolunteerSender={handleVolunteerSenderRegistration}
+            getSyncVolunteers={getSyncVolunteers}
             onAck={handleAck}
             onStatusChange={handleNetworkStatus}
             getSyncRequests={getSyncRequests}
+          />
+        </div>
+
+        <div ref={(el) => { sectionRefs.current.offline = el; }}>
+          <OfflineSync
+            deviceName={device.name}
+            getSyncRequests={getSyncRequests}
+            getSyncVolunteers={getSyncVolunteers}
+            onImport={handleSyncImport}
           />
         </div>
 

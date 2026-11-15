@@ -11,6 +11,18 @@ import {
   toWireRequest,
   makeRequestId,
   withStatus,
+  withAssignment,
+  validateVolunteer,
+  upsertVolunteer,
+  mergeVolunteerLists,
+  matchVolunteers,
+  suggestRequests,
+  uncoveredRequests,
+  toWireVolunteer,
+  volunteerIdForDevice,
+  volunteerLoad,
+  remainingCapacity,
+  fitsCapacity,
   MAX_MESSAGE_CHARS,
 } from "./requestSync.js";
 
@@ -153,3 +165,126 @@ test("withStatus bumps updatedAt so the change wins a merge, and ignores invalid
 function requestNewer(a, b) {
   return Date.parse(a.updatedAt) > Date.parse(b.updatedAt);
 }
+
+const VNOW = Date.parse("2026-11-14T12:00:00.000Z");
+function vol(overrides = {}) {
+  return {
+    id: "VOL-dev1",
+    name: "Sam",
+    skills: ["Water supplies", "Transport"],
+    area: "Camden",
+    available: true,
+    createdAt: "2026-11-14T11:00:00.000Z",
+    updatedAt: "2026-11-14T11:00:00.000Z",
+    ...overrides,
+  };
+}
+
+test("validateVolunteer keeps whitelisted fields and rejects bad input", () => {
+  const ok = validateVolunteer({ ...vol(), skills: ["Water supplies", "Bogus", "Water supplies"], evil: "x" }, VNOW);
+  assert.equal(ok.ok, true);
+  assert.deepEqual(ok.volunteer.skills, ["Water supplies"]);
+  assert.equal("evil" in ok.volunteer, false);
+  assert.equal(validateVolunteer(vol({ id: "x" }), VNOW).ok, false);
+  assert.equal(validateVolunteer(vol({ name: "  " }), VNOW).ok, false);
+  assert.equal(validateVolunteer(vol({ skills: ["Other", "Bogus"] }), VNOW).ok, false);
+  assert.equal(validateVolunteer(vol({ createdAt: "2030-01-01T00:00:00Z" }), VNOW).ok, false);
+  assert.equal(validateVolunteer(vol({ available: false }), VNOW).volunteer.available, false);
+  assert.equal(volunteerIdForDevice("ab12 !x"), "VOL-ab12x");
+  assert.equal(validateVolunteer(toWireVolunteer(vol()), VNOW).ok, true);
+});
+
+test("upsert/merge volunteers: one entry per ID, newest wins", () => {
+  const older = vol();
+  const newer = vol({ available: false, updatedAt: "2026-11-14T11:30:00.000Z" });
+  let list = upsertVolunteer([], older);
+  list = upsertVolunteer(list, newer);
+  assert.equal(list.length, 1);
+  assert.equal(list[0].available, false);
+  assert.equal(upsertVolunteer(list, older)[0].available, false);
+  assert.equal(mergeVolunteerLists([older], [newer, vol({ id: "VOL-dev2", name: "Ana" })]).length, 2);
+});
+
+test("matching: only available volunteers with the right skill; urgent+oldest first", () => {
+  const water = validateRequest(sample({ id: "SOS-w", category: "Water supplies" }), NOW).request;
+  const medical = validateRequest(sample({ id: "SOS-m", category: "Medical assistance" }), NOW).request;
+  const other = validateRequest(sample({ id: "SOS-o", category: "Other" }), NOW).request;
+  const sam = vol();
+  const busy = vol({ id: "VOL-dev2", name: "Busy", available: false });
+  const nurse = vol({ id: "VOL-dev3", name: "Nia", skills: ["Medical assistance"] });
+  const all = [sam, busy, nurse];
+
+  assert.deepEqual(matchVolunteers(water, all).map((v) => v.name), ["Sam"]);
+  assert.deepEqual(matchVolunteers(medical, all).map((v) => v.name), ["Nia"]);
+  assert.deepEqual(matchVolunteers(other, all).map((v) => v.name).sort(), ["Nia", "Sam"]);
+  assert.deepEqual(matchVolunteers({ ...water, status: "Assigned" }, all), []);
+  assert.deepEqual(uncoveredRequests([water, medical], [sam]).map((r) => r.id), ["SOS-m"]);
+
+  const low = validateRequest(sample({ id: "SOS-l", category: "Transport", urgency: "Low", createdAt: "2026-11-14T08:00:00.000Z" }), NOW).request;
+  const crit = validateRequest(sample({ id: "SOS-c", category: "Water supplies", urgency: "Critical", createdAt: "2026-11-14T10:00:00.000Z" }), NOW).request;
+  assert.deepEqual(suggestRequests(sam, [low, crit, medical]).map((r) => r.id), ["SOS-c", "SOS-l"]);
+  assert.deepEqual(suggestRequests(busy, [low, crit]), []);
+});
+
+test("withAssignment assigns, survives the wire, and reopening releases the volunteer", () => {
+  const original = validateRequest(sample(), NOW).request;
+  const assigned = withAssignment(original, vol(), NOW);
+  assert.equal(assigned.status, "Assigned");
+  assert.equal(assigned.assignedTo, "Sam");
+  assert.equal(decideMerge(original, assigned), "update");
+
+  const wire = JSON.parse(JSON.stringify(toWireRequest(assigned)));
+  const received = validateRequest(wire, NOW).request;
+  assert.equal(received.assignedTo, "Sam");
+  assert.equal(received.assignedId, "VOL-dev1");
+
+  const reopened = withStatus(assigned, "Open", NOW + 60000);
+  assert.equal("assignedTo" in reopened, false);
+  assert.equal(validateRequest({ ...toWireRequest(assigned), status: "Open" }, NOW).request.assignedTo, undefined);
+  assert.equal(withAssignment(original, null, NOW), original);
+});
+
+test("parseMessage accepts VOLUNTEER and rejects malformed ones", () => {
+  const text = buildMessage("VOLUNTEER", { volunteer: toWireVolunteer(vol()), hops: 2 });
+  const parsed = parseMessage(text);
+  assert.equal(parsed.type, "VOLUNTEER");
+  assert.equal(parsed.hops, 2);
+  assert.throws(() => parseMessage(JSON.stringify({ type: "VOLUNTEER" })), /no volunteer/);
+});
+
+test("capacity: load counts people on Assigned requests, limits matching, survives the wire", () => {
+  const sam = vol({ capacity: 5 });
+  const req = (id, people, status, extra = {}) =>
+    validateRequest(sample({ id, people, status, category: "Water supplies", ...extra }), NOW).request;
+
+  const a = { ...req("SOS-a", 3, "Assigned"), assignedId: "VOL-dev1", assignedTo: "Sam" };
+  const resolved = { ...req("SOS-r", 4, "Resolved"), assignedId: "VOL-dev1" };
+  const other = { ...req("SOS-o", 4, "Assigned"), assignedId: "VOL-someone-else" };
+  const all = [a, resolved, other];
+
+  assert.equal(volunteerLoad(sam, all), 3, "only this volunteer's Assigned requests count");
+  assert.equal(remainingCapacity(sam, all), 2);
+  assert.equal(remainingCapacity(vol(), all), Infinity, "no limit set means unlimited");
+
+  const small = req("SOS-s", 2, "Open");
+  const big = req("SOS-b", 3, "Open");
+  assert.equal(fitsCapacity(sam, small, all), true);
+  assert.equal(fitsCapacity(sam, big, all), false);
+
+  // can't fit the big one, but is still listed (flagged) while room remains; full volunteers vanish
+  assert.deepEqual(matchVolunteers(big, [sam], all).map((v) => v.id), ["VOL-dev1"]);
+  const full = [{ ...a, people: 5 }];
+  assert.deepEqual(matchVolunteers(small, [sam], full), []);
+  assert.equal(uncoveredRequests([small, { ...small, id: "SOS-s2" }], [sam]).length, 0);
+
+  // fitting volunteers are listed before ones that do not fit
+  const roomy = vol({ id: "VOL-dev9", name: "Zed", capacity: 20 });
+  assert.deepEqual(matchVolunteers(big, [sam, roomy], all).map((v) => v.name), ["Zed", "Sam"]);
+
+  // capacity is validated, clamped and kept on the wire; older profiles have none
+  assert.equal(validateVolunteer(vol({ capacity: 5000 }), VNOW).volunteer.capacity, 1000);
+  assert.equal(validateVolunteer(vol({ capacity: 0 }), VNOW).volunteer.capacity, 1);
+  assert.equal("capacity" in validateVolunteer(vol({ capacity: "lots" }), VNOW).volunteer, false);
+  assert.equal(validateVolunteer(toWireVolunteer(sam), VNOW).volunteer.capacity, 5);
+  assert.equal("capacity" in toWireVolunteer(vol()), false);
+});

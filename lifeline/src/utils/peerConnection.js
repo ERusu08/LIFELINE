@@ -11,6 +11,8 @@ const ICE_SERVERS = [
 
 const STEP_TIMEOUT_MS = 10000;
 
+import { toBase64Url, fromBase64Url, canCompress, deflate, inflate } from "./codec.js";
+
 const noop = () => {};
 
 export function createPeerConnection() {
@@ -195,35 +197,6 @@ export function slimSdp(sdp) {
       return true;
     })
     .join("\r\n") + "\r\n";
-}
-
-function toBase64Url(bytes) {
-  let binary = "";
-  bytes.forEach((b) => (binary += String.fromCharCode(b)));
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-function fromBase64Url(text) {
-  const b64 = text.replace(/-/g, "+").replace(/_/g, "/");
-  const binary = atob(b64);
-  return Uint8Array.from(binary, (c) => c.charCodeAt(0));
-}
-
-function canCompress() {
-  return (
-    typeof CompressionStream !== "undefined" &&
-    typeof DecompressionStream !== "undefined"
-  );
-}
-
-async function deflate(text) {
-  const stream = new Blob([text]).stream().pipeThrough(new CompressionStream("deflate-raw"));
-  return new Uint8Array(await new Response(stream).arrayBuffer());
-}
-
-async function inflate(bytes) {
-  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
-  return new Response(stream).text();
 }
 
 /**

@@ -4,9 +4,12 @@ import { chromium } from "playwright-core";
 import { spawn } from "node:child_process";
 
 const CHROME = process.env.CHROME_PATH || "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
-const PORT = 4174;
+const PORT = 4182; // no API server on purpose: triage must fall back to the device
 const URL = `http://localhost:${PORT}/`;
-const server = spawn("npx", ["vite", "preview", "--port", String(PORT)], { stdio: "ignore" });
+const server = spawn("npx", ["vite", "preview", "--port", String(PORT)], {
+  stdio: "ignore",
+  env: { ...process.env, LIFELINE_API: "http://127.0.0.1:3019" }, // nothing listens here
+});
 const results = [];
 const check = (n, ok) => { results.push(ok); console.log(`${ok ? "PASS" : "FAIL"}  ${n}`); };
 
@@ -64,6 +67,20 @@ try {
     return row?.querySelector("select")?.value === "Resolved";
   }, null, { timeout: 15000 });
   check("C's status change reached A through B", true);
+
+  // volunteer registered on C is relayed to A through B
+  await C.getByTestId("volunteer-panel").getByLabel("Volunteer name").fill("Charlie Vol");
+  await C.getByTestId("volunteer-panel").getByLabel("Shelter").check();
+  await C.getByTestId("volunteer-panel").getByRole("button", { name: "Register as volunteer" }).click();
+  await A.getByTestId("volunteer-row").filter({ hasText: "Charlie Vol" }).waitFor({ timeout: 15000 });
+  check("volunteer from C reached A through B", true);
+
+  // triage with NO server running falls back to on-device rules
+  await A.getByRole("button", { name: /New request/ }).click();
+  await A.getByLabel("Describe the situation").fill("Man unconscious and not breathing");
+  await A.getByRole("button", { name: /Suggest category and urgency/ }).click();
+  const text = await A.getByTestId("triage-result").innerText();
+  check("offline triage uses on-device rules and flags Critical", /on-device rules/.test(text) && /Critical/.test(text) && /Medical assistance/.test(text));
 } catch (e) {
   console.error("E2E ERROR:", e.message);
   results.push(false);

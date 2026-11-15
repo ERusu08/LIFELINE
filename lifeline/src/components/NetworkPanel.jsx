@@ -13,6 +13,7 @@ import {
   buildMessage,
   parseMessage,
   toWireRequest,
+  toWireVolunteer,
 } from "../utils/requestSync";
 
 const READER_ID = "lifeline-reader";
@@ -75,6 +76,9 @@ const STATE_TEXT = {
  *  - onAck(requestId, { key, label })          a peer confirmed it stored a request
  *  - onStatusChange({ peers, openCount })      real connection state
  *  - getSyncRequests() => request[]            shared with every newly opened peer
+ *  - onVolunteer(volunteer, meta) => Promise<{ ok, status, volunteer?, error? }>
+ *  - onRegisterVolunteerSender(sender | null)  sender(volunteer) => boolean
+ *  - getSyncVolunteers() => volunteer[]        shared with every newly opened peer
  */
 export default function NetworkPanel(props) {
   const { device, onDeviceNameChange } = props;
@@ -149,8 +153,18 @@ export default function NetworkPanel(props) {
           return false;
         }
       });
+      propsRef.current.onRegisterVolunteerSender?.((volunteer) => {
+        try {
+          const text = buildMessage("VOLUNTEER", { volunteer: toWireVolunteer(volunteer), hops: 0 });
+          return broadcast(text).length > 0;
+        } catch (error) {
+          log(`Could not send volunteer ${volunteer?.id}: ${error.message}`);
+          return false;
+        }
+      });
     } else {
       propsRef.current.onRegisterSender?.(null);
+      propsRef.current.onRegisterVolunteerSender?.(null);
     }
   }, [broadcast, log]);
 
@@ -224,6 +238,32 @@ export default function NetworkPanel(props) {
       return;
     }
 
+    if (message.type === "VOLUNTEER") {
+      let outcome;
+      try {
+        outcome = await propsRef.current.onVolunteer?.(message.volunteer, {
+          fromKey: entry.key,
+          fromLabel: entry.label,
+        });
+      } catch (error) {
+        outcome = { ok: false, error: error.message };
+      }
+      if (!outcome?.ok) {
+        log(`Rejected volunteer from ${entry.label}: ${outcome?.error || "not saved"}`);
+        return;
+      }
+      if (outcome.status === "duplicate") return;
+      log(`Volunteer "${outcome.volunteer.name}" received from ${entry.label}.`);
+      if (message.hops + 1 <= MAX_HOPS) {
+        const text = buildMessage("VOLUNTEER", {
+          volunteer: toWireVolunteer(outcome.volunteer),
+          hops: message.hops + 1,
+        });
+        broadcast(text, entry.key);
+      }
+      return;
+    }
+
     // SOS_REQUEST
     const id = message.request?.id;
     let result;
@@ -292,6 +332,14 @@ export default function NetworkPanel(props) {
         }
       }
       if (shared) log(`Shared ${shared} saved request(s) with ${entry.label}.`);
+
+      for (const volunteer of propsRef.current.getSyncVolunteers?.() || []) {
+        try {
+          sendTo(entry, buildMessage("VOLUNTEER", { volunteer: toWireVolunteer(volunteer), hops: 0 }));
+        } catch (error) {
+          log(`Skipped volunteer ${volunteer.id} during sync: ${error.message}`);
+        }
+      }
     };
 
     channel.onclose = () => {
@@ -540,6 +588,7 @@ export default function NetworkPanel(props) {
       peerMap.clear();
       pendingRef.current = null;
       propsRef.current.onRegisterSender?.(null);
+      propsRef.current.onRegisterVolunteerSender?.(null);
       propsRef.current.onStatusChange?.({ peers: [], openCount: 0 });
     };
   }, []);

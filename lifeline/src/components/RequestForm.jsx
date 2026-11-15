@@ -1,7 +1,8 @@
 
 import { useEffect, useRef, useState } from "react";
-import { X, Send, AlertTriangle, MapPin, LocateFixed } from "lucide-react";
+import { X, Send, AlertTriangle, MapPin, LocateFixed, Sparkles } from "lucide-react";
 import { CATEGORIES, URGENCIES, makeRequestId } from "../utils/requestSync";
+import { suggestTriage, SOURCE_LABEL } from "../utils/triage";
 
 export default function RequestForm({ onClose, onSubmit }) {
   const [form, setForm] = useState({
@@ -16,6 +17,9 @@ export default function RequestForm({ onClose, onSubmit }) {
   // One ID per form, so a double-click can never create two requests.
   const idRef = useRef(makeRequestId());
   const [submitting, setSubmitting] = useState(false);
+  const [suggestion, setSuggestion] = useState(null);
+  const [suggesting, setSuggesting] = useState(false);
+  const triageRunRef = useRef(0);
   const [formError, setFormError] = useState("");
   const [coordinates, setCoordinates] = useState(null);
   const [locationError, setLocationError] = useState("");
@@ -32,6 +36,27 @@ export default function RequestForm({ onClose, onSubmit }) {
       ...previous,
       [field]: value,
     }));
+  }
+
+  async function runTriage() {
+    const run = ++triageRunRef.current;
+    setSuggesting(true);
+    setSuggestion(null);
+    const result = await suggestTriage(form.description);
+    // Ignore the answer if the description changed while we were waiting.
+    if (run !== triageRunRef.current) return;
+    setSuggesting(false);
+    setSuggestion(result);
+  }
+
+  function applySuggestion() {
+    setForm((previous) => ({
+      ...previous,
+      category: suggestion.category,
+      urgency: suggestion.urgency,
+      people: suggestion.people || previous.people,
+    }));
+    setSuggestion(null);
   }
 
   function getLocation() {
@@ -212,10 +237,41 @@ export default function RequestForm({ onClose, onSubmit }) {
             required
             rows="3"
             value={form.description}
-            onChange={(e) => update("description", e.target.value)}
+            onChange={(e) => {
+              update("description", e.target.value);
+              triageRunRef.current += 1; // any pending suggestion is now stale
+              setSuggestion(null);
+              setSuggesting(false);
+            }}
             placeholder="Explain what has happened and what is needed..."
           />
         </label>
+
+        <div className="triage">
+          <button
+            type="button"
+            className="btn"
+            onClick={runTriage}
+            disabled={suggesting || form.description.trim().length < 5}
+          >
+            <Sparkles size={16} /> {suggesting ? "Analysing…" : "Suggest category and urgency"}
+          </button>
+
+          {suggestion && (
+            <div className="triage-result" role="status" data-testid="triage-result">
+              <p>
+                Suggested: <strong>{suggestion.category}</strong> ·{" "}
+                <strong>{suggestion.urgency}</strong>
+                {suggestion.people ? <> · <strong>{suggestion.people}</strong> {suggestion.people === 1 ? "person" : "people"}</> : null}
+              </p>
+              <small>From {SOURCE_LABEL[suggestion.source]}. Check it before applying.</small>
+              <div className="btn-row">
+                <button type="button" className="btn small" data-testid="triage-apply" onClick={applySuggestion}>Apply</button>
+                <button type="button" className="btn small" onClick={() => setSuggestion(null)}>Dismiss</button>
+              </div>
+            </div>
+          )}
+        </div>
 
         {formError && <p className="form-error" role="alert">{formError}</p>}
 

@@ -5,10 +5,19 @@ import { spawn } from "node:child_process";
 import assert from "node:assert/strict";
 
 const CHROME = process.env.CHROME_PATH || "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
-const PORT = 4173;
+const PORT = 4181; // own ports, so a running dev/share server is never reused
+const API_PORT = 3011;
 const URL = `http://localhost:${PORT}/`;
 
-const server = spawn("npx", ["vite", "preview", "--port", String(PORT)], { stdio: "ignore" });
+const server = spawn("npx", ["vite", "preview", "--port", String(PORT)], {
+  stdio: "ignore",
+  env: { ...process.env, LIFELINE_API: `http://127.0.0.1:${API_PORT}` },
+});
+// Triage server (rules mode: the key is blanked so no external AI call is made).
+const api = spawn("node", ["../server/index.js"], {
+  stdio: "ignore",
+  env: { ...process.env, GEMINI_API_KEY: "", PORT: String(API_PORT) },
+});
 const results = [];
 const check = (name, ok) => { results.push([name, ok]); console.log(`${ok ? "PASS" : "FAIL"}  ${name}`); };
 
@@ -36,11 +45,17 @@ async function newDevice(browser, name) {
   return { page, context, errors, name };
 }
 
-async function createRequest(page, { name, description, gps = true }) {
+async function createRequest(page, { name, description, gps = true, suggest = false }) {
   await page.getByRole("button", { name: /New request/  }).click();
   await page.getByLabel("Household or reporter name").fill(name);
   await page.getByLabel("Location / neighbourhood").fill("Camden Town");
   await page.getByLabel("Describe the situation").fill(description);
+  if (suggest) {
+    await page.getByRole("button", { name: /Suggest category and urgency/ }).click();
+    await page.getByTestId("triage-result").waitFor();
+    suggest.text = await page.getByTestId("triage-result").innerText();
+    await page.getByTestId("triage-apply").click();
+  }
   if (gps) {
     await page.getByRole("button", { name: /Use my current location/ }).click();
     await page.getByText("Location captured successfully").waitFor();
@@ -52,6 +67,10 @@ async function createRequest(page, { name, description, gps = true }) {
 let browser;
 try {
   await waitForServer();
+  for (let i = 0; i < 50; i++) {
+    try { if ((await fetch(`http://127.0.0.1:${API_PORT}/api/health`)).ok) break; } catch { /* not up yet */ }
+    await new Promise((r) => setTimeout(r, 200));
+  }
   browser = await chromium.launch({ executablePath: CHROME, headless: true, args: ["--use-fake-ui-for-media-stream", "--use-fake-device-for-media-stream"] });
   const A = await newDevice(browser, "Alpha");
   const B = await newDevice(browser, "Bravo");
@@ -120,6 +139,92 @@ try {
   }, null, { timeout: 10000 });
   check("status change on B propagates to A", true);
 
+  // ---- AI triage through the server ----
+  const triage = {};
+  await createRequest(A.page, { name: "Thirsty Household", description: "No drinking water, family of 4", suggest: triage });
+  check("triage suggestion comes from the LIFELINE server", /LIFELINE server rules/.test(triage.text));
+  await B.page.getByText("Thirsty Household").first().waitFor({ timeout: 10000 });
+  check("triage-applied category and people are on the saved request", /Water supplies · Camden Town · 4 people/.test(
+    await A.page.locator('[data-testid="request-row"]').filter({ hasText: "Thirsty Household" }).innerText()));
+
+  // ---- volunteers: register on B, sync to A ----
+  const panelB = B.page.getByTestId("volunteer-panel");
+  await panelB.getByRole("button", { name: "Register as volunteer" }).click();
+  check("volunteer needs at least one skill", await panelB.getByRole("alert").isVisible());
+  await panelB.getByLabel("Volunteer name").fill("Bravo Vol");
+  await panelB.getByLabel("Water supplies").check();
+  await panelB.getByLabel("Area you can cover").fill("Camden");
+  await panelB.getByLabel("People you can help at once").fill("5");
+  await panelB.getByRole("button", { name: "Register as volunteer" }).click();
+  await panelB.getByTestId("my-profile").waitFor();
+  check("volunteer profile saved on B", true);
+  await A.page.getByTestId("volunteer-row").filter({ hasText: "Bravo Vol" }).waitFor({ timeout: 10000 });
+  check("volunteer synced to A", true);
+
+  // ---- matching and assignment ----
+  const thirstyA = A.page.locator('[data-testid="request-row"]').filter({ hasText: "Thirsty Household" });
+  await thirstyA.locator('[data-testid="matches"] summary').click();
+  check("A shows Bravo Vol as a match for the water request", /1 volunteer can help/.test(await thirstyA.getByTestId("matches").innerText()));
+  const medicalA = A.page.locator('[data-testid="request-row"]').filter({ hasText: "Offline Household" });
+  check("medical request has no water volunteer match", /No available volunteer matches/.test(await medicalA.getByTestId("matches").innerText()));
+  check("uncovered-request warning is shown", await A.page.getByTestId("uncovered").isVisible());
+  await thirstyA.getByTestId("assign-button").click();
+  await A.page.waitForFunction(() => {
+    const row = [...document.querySelectorAll('[data-testid="request-row"]')].find((r) => r.textContent.includes("Thirsty Household"));
+    return row?.querySelector("select")?.value === "Assigned" && row.textContent.includes("Assigned to Bravo Vol");
+  }, null, { timeout: 10000 });
+  check("A: assignment sets status Assigned and shows the volunteer", true);
+  await B.page.waitForFunction(() => {
+    const row = [...document.querySelectorAll('[data-testid="request-row"]')].find((r) => r.textContent.includes("Thirsty Household"));
+    return row?.querySelector("select")?.value === "Assigned" && row.textContent.includes("Assigned to Bravo Vol");
+  }, null, { timeout: 10000 });
+  check("B: assignment synced to the volunteer's own device", true);
+
+  // reopening releases the volunteer on both devices
+  await thirstyA.getByTestId("status-select").selectOption("Open");
+  await B.page.waitForFunction(() => {
+    const row = [...document.querySelectorAll('[data-testid="request-row"]')].find((r) => r.textContent.includes("Thirsty Household"));
+    return row?.querySelector("select")?.value === "Open" && !row.textContent.includes("Assigned to");
+  }, null, { timeout: 10000 });
+  check("reopening releases the volunteer on B", true);
+
+  // volunteer takes a request themselves
+  const takeThirsty = panelB.locator("li").filter({ hasText: "Thirsty Household" }).getByTestId("take-button");
+  await takeThirsty.waitFor();
+  await takeThirsty.click();
+  await A.page.waitForFunction(() => document.body.textContent.includes("Assigned to Bravo Vol"), null, { timeout: 10000 });
+  check("volunteer self-assignment on B reaches A", true);
+
+  // capacity: B now helps 4 of 5 people, so a 3-person water request must not be assignable
+  await B.page.getByTestId("my-capacity").getByText("Helping 4 of 5").waitFor({ timeout: 10000 });
+  check("B's profile shows the load: Helping 4 of 5", true);
+  await A.page.getByTestId("volunteer-row").filter({ hasText: "Bravo Vol" }).getByText(/Helping 4 of 5/).waitFor({ timeout: 10000 });
+  check("A sees B's load computed from synced requests", true);
+
+  const tight = {};
+  await createRequest(A.page, { name: "Big Household", description: "Need drinking water for 3 people", suggest: tight });
+  const bigA = A.page.locator('[data-testid="request-row"]').filter({ hasText: "Big Household" });
+  await bigA.waitFor();
+  await bigA.locator('[data-testid="matches"] summary').click();
+  check("over-capacity volunteer is flagged and Assign is disabled",
+    /Needs room for 3, has 1/.test(await bigA.getByTestId("capacity-note").innerText()) &&
+    (await bigA.getByTestId("assign-button").isDisabled()));
+  await B.page.getByText("Big Household").first().waitFor({ timeout: 10000 });
+  const takeBig = B.page.getByTestId("volunteer-panel").locator("li").filter({ hasText: "Big Household" }).getByTestId("take-button");
+  check("the volunteer's own Take button is disabled too", await takeBig.isDisabled());
+
+  // resolving a request frees capacity
+  const thirstyB = B.page.locator('[data-testid="request-row"]').filter({ hasText: "Thirsty Household" });
+  await thirstyB.getByTestId("status-select").selectOption("Resolved");
+  await B.page.getByTestId("my-capacity").getByText("Helping 0 of 5").waitFor({ timeout: 10000 });
+  await bigA.getByTestId("assign-button").and(A.page.locator(":enabled")).waitFor({ timeout: 10000 });
+  check("resolving a request frees capacity and Assign becomes available", true);
+
+  // availability
+  await panelB.getByRole("button", { name: "Mark not available" }).click();
+  await A.page.getByTestId("volunteer-row").filter({ hasText: "Bravo Vol" }).getByText("Not available").waitFor({ timeout: 10000 });
+  check("availability change synced to A", true);
+
   // ---- disconnect handling ----
   await A.page.getByRole("button", { name: "Disconnect" }).click();
   await A.page.getByTestId("network-pill").getByText(/Not connected/).waitFor();
@@ -130,6 +235,9 @@ try {
   await B.page.reload();
   await B.page.waitForSelector('[data-testid="request-row"]');
   check("received request persists on B after refresh", (await B.page.getByText("Live Household").count()) === 1);
+  await B.page.getByTestId("my-profile").waitFor();
+  check("volunteer profile persists on B after refresh", true);
+  check("assignment persists on B after refresh", (await B.page.getByText("Assigned to Bravo Vol").count()) >= 1);
 
   // ---- mobile layout ----
   await A.page.setViewportSize({ width: 390, height: 800 });
@@ -147,6 +255,7 @@ try {
 } finally {
   await browser?.close();
   server.kill();
+  api.kill();
 }
 const failed = results.filter(([, ok]) => !ok);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);

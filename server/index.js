@@ -103,7 +103,7 @@ async function classifyWithGemini(description) {
 
   try {
     const response = await fetch(
-      "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent",
+      `https://generativelanguage.googleapis.com/v1beta/models/${process.env.GEMINI_MODEL || "gemini-3.8-flash"}:generateContent`,
       {
         method: "POST",
         headers: {
@@ -240,6 +240,28 @@ function markPossibleDuplicates() {
 
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true, service: "LIFELINE backend" });
+});
+
+// Stateless triage for the LIFELINE app: suggests a type, urgency and head-count
+// for a description. Nothing is stored. Uses Gemini when GEMINI_API_KEY is set
+// (the description is then sent to Google), otherwise local keyword rules.
+app.post("/api/triage", async (req, res) => {
+  const { description } = req.body ?? {};
+
+  if (typeof description !== "string" || !description.trim()) {
+    return res.status(400).json({ error: "description is required" });
+  }
+
+  const text = description.trim().slice(0, 2000);
+  const { type, urgency, source } = await classifyWithGemini(text);
+
+  res.json({
+    type,
+    urgency,
+    source,
+    peopleAffected: extractPeopleCount(text),
+    needs: extractResources(text),
+  });
 });
 
 app.get("/api/reports", (req, res) => {

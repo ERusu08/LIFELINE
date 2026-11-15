@@ -13,7 +13,10 @@
     "share": "vite build && vite preview",
     "tunnel:share": "npx -y localtunnel --port 4173 --local-host 127.0.0.1",
     "test": "node --test src/utils/",
-    "e2e": "node e2e/two-devices.mjs && node e2e/relay-chain.mjs"
+    "e2e": "node e2e/two-devices.mjs && node e2e/relay-chain.mjs && node e2e/offline.mjs",
+    "server": "node ../server/index.js",
+    "dev:full": "concurrently -n web,api \"npm:dev\" \"npm:server\"",
+    "share:full": "concurrently -n web,api \"npm:share\" \"npm:server\""
   },
   "dependencies": {
     "@google/genai": "^3.3.0",
