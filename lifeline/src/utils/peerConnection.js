@@ -67,13 +67,14 @@ function watchIceGathering(peer, log) {
 
   const promise = new Promise((resolve, reject) => {
     const started = Date.now();
-    const counts = { host: 0, srflx: 0, relay: 0, prflx: 0 };
+    const counts = { host: 0, srflx: 0, relay: 0, prflx: 0, hidden: 0 };
     let finished = false;
 
     const onCandidate = (event) => {
       if (!event.candidate || !event.candidate.candidate) return;
       const type = candidateType(event.candidate);
       counts[type] = (counts[type] || 0) + 1;
+      if (type === "host" && /\.local\b/.test(event.candidate.candidate)) counts.hidden += 1;
     };
 
     const finish = (reason) => {
@@ -100,6 +101,12 @@ function watchIceGathering(peer, log) {
         `Network info ready (${reason}, ${seconds}s): ` +
         `${counts.host} local, ${counts.srflx} public candidate(s).`
       );
+      if (counts.hidden > 0) {
+        log(
+          `${counts.hidden} local address(es) are hidden behind ".local" names by the browser. ` +
+          "If devices fail to connect on the same Wi-Fi/hotspot, this is the likely reason."
+        );
+      }
       resolve(counts);
     };
 
@@ -285,10 +292,47 @@ export async function decodeSignal(text) {
   throw new Error("Invalid pairing code.");
 }
 
+/**
+ * Browsers hide a device's real local (Wi-Fi) address behind a random
+ * ".local" name, which other devices on a phone hotspot often cannot resolve.
+ * They only reveal the real address once the page has camera permission, so we
+ * briefly open the camera while the pairing code is built, then release it.
+ * If permission is refused we carry on; the connection may still work.
+ */
+async function openAddressAccess(log) {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    log("Camera access is not available, so local addresses may stay hidden.");
+    return null;
+  }
+  try {
+    const stream = await withTimeout(
+      navigator.mediaDevices.getUserMedia({ video: { width: 160, height: 120 } }),
+      20000,
+      "Camera permission"
+    );
+    log("Camera permission granted (used only to reveal this device's Wi-Fi address).");
+    return stream;
+  } catch (error) {
+    log(`Camera permission not granted (${error?.message || error}). Connecting may fail on a phone hotspot. Allow the camera and pair again.`);
+    return null;
+  }
+}
+
+function closeAddressAccess(stream) {
+  stream?.getTracks().forEach((track) => track.stop());
+}
+
 /* ---------- Pairing steps ---------- */
 
 export async function createOffer({ log = noop } = {}) {
-  const peer = createPeerConnection();
+  const media = await openAddressAccess(log);
+  let peer;
+  try {
+    peer = createPeerConnection();
+  } catch (error) {
+    closeAddressAccess(media);
+    throw error;
+  }
   const ice = watchIceGathering(peer, log);
 
   try {
@@ -302,6 +346,8 @@ export async function createOffer({ log = noop } = {}) {
     ice.cancel();
     peer.close();
     throw error;
+  } finally {
+    closeAddressAccess(media);
   }
 }
 
@@ -309,7 +355,14 @@ export async function createOffer({ log = noop } = {}) {
 // answer and the connection opens. It is never awaited here: the channel can
 // only open after the answer QR has been shown and scanned.
 export async function acceptOffer(offer, { log = noop, onChannel = noop } = {}) {
-  const peer = createPeerConnection();
+  const media = await openAddressAccess(log);
+  let peer;
+  try {
+    peer = createPeerConnection();
+  } catch (error) {
+    closeAddressAccess(media);
+    throw error;
+  }
   peer.addEventListener("datachannel", (event) => onChannel(event.channel));
   const ice = watchIceGathering(peer, log);
 
@@ -324,6 +377,8 @@ export async function acceptOffer(offer, { log = noop, onChannel = noop } = {}) 
     ice.cancel();
     peer.close();
     throw error;
+  } finally {
+    closeAddressAccess(media);
   }
 }
 

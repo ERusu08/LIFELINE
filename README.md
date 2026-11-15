@@ -37,7 +37,7 @@ npm run share            # terminal 1: builds and serves on :4173
 npm run tunnel:share     # terminal 2: prints an https://….loca.lt link
 ```
 
-Open the link on each device. On one, tap **Create pairing QR**. On the other, tap **Scan pairing QR**, scan it, then show the answer QR back to the first device. Devices on the same Wi-Fi or hotspot connect most reliably.
+Open the link on each device and **allow camera access when asked**. LIFELINE briefly opens the camera while it builds a pairing code, because browsers only reveal a device's real Wi-Fi address (instead of a hidden `.local` name) once the camera is allowed. Without it, devices on a phone hotspot usually fail to connect. On one, tap **Create pairing QR**. On the other, tap **Scan pairing QR**, scan it, then show the answer QR back to the first device. Devices on the same Wi-Fi or hotspot connect most reliably.
 
 ## Scripts (run inside `lifeline/`)
 
@@ -75,12 +75,13 @@ lifeline/src
 
 - Unit tests, lint and production build pass.
 - Browser tests on one machine (real Chrome, pasted codes instead of camera scanning) cover: form validation, double-click protection, persistence across refresh, two-device pairing, request transfer, acknowledgements, status sync, disconnect handling, a three-device relay chain, mobile layout without horizontal overflow.
-- **Not yet tested**: camera QR scanning, phones, different networks, real hotspot conditions.
+- Confirmed by hand on real devices: a MacBook (Chrome) and an iPhone (Chrome) paired and connected over a phone hotspot.
+- **Not yet tested**: more than two physical devices, devices on different networks.
 
 ## Known limits
 
 - Refreshing a page drops its peer links; devices must be paired again.
-- Without a TURN server, devices on different networks or behind strict NAT may not connect.
+- Pairing needs camera permission (see above). There is no TURN relay, so devices on different networks or behind strict NAT may not connect. Wi-Fi with client isolation (some guest/university networks) will also block it.
 - Anyone paired can change any request's status. There are no accounts or roles.
 - Map tiles need internet access.
 - Volunteers and resource matching are not built yet.
@@ -88,7 +89,7 @@ lifeline/src
 
 ## Roadmap
 
-1. Test on physical phones and laptops.
+1. Test with more physical devices (three or more).
 2. Reconnect without re-pairing.
 3. Connect the AI triage server to the app.
 4. Volunteer and resource matching.

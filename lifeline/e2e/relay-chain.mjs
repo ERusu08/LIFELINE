@@ -11,7 +11,7 @@ const results = [];
 const check = (n, ok) => { results.push(ok); console.log(`${ok ? "PASS" : "FAIL"}  ${n}`); };
 
 async function device(browser, name) {
-  const ctx = await browser.newContext({ geolocation: { latitude: 51.54, longitude: -0.14 }, permissions: ["geolocation"] });
+  const ctx = await browser.newContext({ geolocation: { latitude: 51.54, longitude: -0.14 }, permissions: ["geolocation", "camera"] });
   const page = await ctx.newPage();
   await page.goto(URL);
   await page.getByLabel("This device's name").fill(name);
@@ -36,7 +36,7 @@ async function pair(offerer, answerer) {
 let browser;
 try {
   for (let i = 0; i < 50; i++) { try { if ((await fetch(URL)).ok) break; } catch { /* wait */ } await new Promise((r) => setTimeout(r, 200)); }
-  browser = await chromium.launch({ executablePath: CHROME, headless: true });
+  browser = await chromium.launch({ executablePath: CHROME, headless: true, args: ["--use-fake-ui-for-media-stream", "--use-fake-device-for-media-stream"] });
   const A = await device(browser, "Alpha"), B = await device(browser, "Bravo"), C = await device(browser, "Charlie");
 
   await pair(A, B);

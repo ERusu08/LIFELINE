@@ -23,7 +23,7 @@ async function waitForServer() {
 async function newDevice(browser, name) {
   const context = await browser.newContext({
     geolocation: { latitude: 51.541, longitude: -0.145 },
-    permissions: ["geolocation"],
+    permissions: ["geolocation", "camera"],
     viewport: { width: 1280, height: 900 },
   });
   const page = await context.newPage();
@@ -52,7 +52,7 @@ async function createRequest(page, { name, description, gps = true }) {
 let browser;
 try {
   await waitForServer();
-  browser = await chromium.launch({ executablePath: CHROME, headless: true });
+  browser = await chromium.launch({ executablePath: CHROME, headless: true, args: ["--use-fake-ui-for-media-stream", "--use-fake-device-for-media-stream"] });
   const A = await newDevice(browser, "Alpha");
   const B = await newDevice(browser, "Bravo");
 
@@ -93,6 +93,10 @@ try {
   await A.page.getByTestId("network-pill").getByText(/Connected to 1 device/).waitFor({ timeout: 30000 });
   await B.page.getByTestId("network-pill").getByText(/Connected to 1 device/).waitFor({ timeout: 30000 });
   check("both devices report OPEN data channel", true);
+  for (const d of [A, B]) {
+    const log = await d.page.getByTestId("network-log").innerText();
+    check(`${d.name}: real local address exposed (not hidden behind .local)`, /Camera permission granted/.test(log) && !/hidden behind/.test(log));
+  }
 
   // backlog sync on connect
   await B.page.getByText("Offline Household").first().waitFor({ timeout: 10000 });
