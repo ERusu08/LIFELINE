@@ -13,10 +13,10 @@ import { useEffect } from "react";
 // Creates coloured markers according to emergency urgency
 function createIcon(urgency) {
   const colours = {
-    Critical: "#ef4444",
-    High: "#f97316",
-    Medium: "#eab308",
-    Low: "#22c55e",
+    Critical: "#b3261e",
+    High: "#c5611a",
+    Medium: "#a8860f",
+    Low: "#4a7d56",
   };
 
   return L.divIcon({
@@ -25,9 +25,9 @@ function createIcon(urgency) {
       background:${colours[urgency] || "#64748b"};
       width:18px;
       height:18px;
-      border:3px solid white;
+      border:3px solid #fbfaf6;
       border-radius:50%;
-      box-shadow:0 2px 8px #0008;
+      box-shadow:0 0 0 1.5px #1d1b17;
     "></div>`,
     iconSize: [18, 18],
     iconAnchor: [9, 9],
